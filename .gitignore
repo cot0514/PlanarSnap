@@ -10,3 +10,21 @@ __pycache__/
 # 3DGS Output folders
 outputs/
 360_v2/
+# 데이터 및 결과물 폴더
+output/
+*.ply
+*.mp4
+*.obj
+*.dxf
+*.npy
+
+# 파이썬 및 가상환경 캐시
+__pycache__/
+*.pyc
+.env
+.venv/
+
+# VS Code 설정 및 C++ 빌드 찌꺼기
+.vscode/
+build/
+*.so

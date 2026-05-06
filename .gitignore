@@ -1,0 +1,12 @@
+# 3D Data & Numpy arrays (용량 폭발 방지)
+*.ply
+*.npy
+*.npz
+
+# Python cache
+__pycache__/
+*.pyc
+
+# 3DGS Output folders
+outputs/
+360_v2/

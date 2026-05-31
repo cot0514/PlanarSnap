@@ -114,6 +114,8 @@ class GaussianExtractor(object):
             iterator = enumerate(self.viewpoint_stack)
 
         for i, viewpoint_cam in iterator:
+            viewpoint_cam.image_width  = viewpoint_cam.image_width  - (viewpoint_cam.image_width  % 16)
+            viewpoint_cam.image_height = viewpoint_cam.image_height - (viewpoint_cam.image_height % 16)
             render_pkg = self.render(viewpoint_cam, self.gaussians)
             times.append(render_pkg['fps'])
             rgb = render_pkg['render']

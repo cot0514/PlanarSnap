@@ -17,6 +17,7 @@ output/
 *.obj
 *.dxf
 *.npy
+log*
 
 # 파이썬 및 가상환경 캐시
 __pycache__/

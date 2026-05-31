@@ -10,7 +10,10 @@
 #
 
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+import gc
+import time
+import numpy as np
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
 
 import torch
 from random import randint
@@ -45,7 +48,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians, add_sky_box=opt.add_sky_box, max_read_points=opt.max_read_points, sphere_point=opt.sphere_point)
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -63,8 +66,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     initial_texture_alpha = gaussians.get_texture_alpha[0:1].detach().clone()
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    _wall_prev = time.perf_counter()
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
 
         iter_start.record()
 
@@ -79,16 +83,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
         
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        _profile = (iteration <= 5 or iteration % 500 == 0 or (1100 <= iteration <= 1115) or (1200 <= iteration <= 1320))
+        _raster_debug = False
+
+        with torch.no_grad():
+            # Only replace NaN/Inf — do NOT clamp xyz, that restricts valid scene coordinates.
+            gaussians._xyz.data = torch.nan_to_num(gaussians._xyz.data, nan=0.0, posinf=1e4, neginf=-1e4)
+            if hasattr(gaussians, '_scaling'):
+                gaussians._scaling.data = torch.nan_to_num(torch.clamp(gaussians._scaling.data, min=-15.0, max=8.0), nan=-5.0, posinf=8.0, neginf=-15.0)
+            if hasattr(gaussians, '_rotation'):
+                rot_bad = ~torch.isfinite(gaussians._rotation.data).all(dim=-1)
+                if rot_bad.any():
+                    gaussians._rotation.data[rot_bad] = torch.tensor([1.0, 0.0, 0.0, 0.0], device='cuda')
+
+        if _profile: torch.cuda.synchronize(); _t0 = time.perf_counter()
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, raster_debug=_raster_debug)
+        if _profile: torch.cuda.synchronize(); _t1 = time.perf_counter()
+        image = render_pkg["render"]
+        viewspace_point_tensor = render_pkg["viewspace_points"]
+        visibility_filter = render_pkg["visibility_filter"]
+        radii = render_pkg["radii"]
         impact = render_pkg["impact"]
-        
+
         gt_image = viewpoint_cam.original_image.cuda()
+        gt_image = gt_image[:, :viewpoint_cam.image_height, :viewpoint_cam.image_width]
 
         Ll1 = l1_loss(image, gt_image)
         ssim_map = ssim(image, gt_image, size_average=False)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_map.mean())
-        
+
         # regularization
         lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
         lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
@@ -100,6 +123,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         normal_loss = lambda_normal * (normal_error).mean()
         dist_loss = lambda_dist * (rend_dist).mean()
 
+        if _profile: torch.cuda.synchronize(); _t2 = time.perf_counter()
         weights = opt.max_impact_threshold - torch.clamp(impact[visibility_filter], 0, opt.max_impact_threshold)
         textures_reg = (gaussians.get_texture_color[visibility_filter].mean(dim=[1, 2, 3]) * weights).mean() * opt.lambda_texture_value
         textures_reg += torch.abs((gaussians.get_texture_alpha[visibility_filter] - initial_texture_alpha).mean(dim=[1, 2]) * weights).mean() * opt.lambda_alpha_value
@@ -108,9 +132,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         total_loss = loss + dist_loss + normal_loss + textures_reg
         # For MCMC sampler
         total_loss += opt.opacity_reg * gaussians.get_texture_alpha.mean()
+        if _profile: torch.cuda.synchronize(); _t3 = time.perf_counter()
         total_loss.backward()
 
         iter_end.record()
+        if _profile:
+            torch.cuda.synchronize(); _t4 = time.perf_counter()
+            print(f"[PROFILE iter={iteration}] render={(_t1-_t0)*1000:.1f}ms  loss={(_t2-_t1)*1000:.1f}ms  texreg={(_t3-_t2)*1000:.1f}ms  backward={(_t4-_t3)*1000:.1f}ms  N={gaussians._xyz.shape[0]}")
 
         with torch.no_grad():
             # Progress bar
@@ -143,6 +171,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+            if iteration in testing_iterations or iteration in saving_iterations:
+                gc.collect()
+                torch.cuda.empty_cache()
 
             if opt.texture_from_iter <= iteration < opt.texture_to_iter:
                 gaussians.activate_texture_training()
@@ -155,16 +186,40 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Densification
             if iteration < opt.densify_until_iter and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                size = len(gaussians.get_texture_alpha)
+                _t_dens = time.perf_counter()
+                size = gaussians._texture_alpha.shape[0]
                 dead_mask = (gaussians.get_texture_alpha.view(size, -1).mean(1) <= opt.dead_opacity).squeeze(-1)
-                
+                _t_mask = time.perf_counter()
                 gaussians.relocate_gs(dead_mask=dead_mask)
+                _t_rel = time.perf_counter()
                 gaussians.add_new_gs(cap_max=opt.cap_max)
+                _t_add = time.perf_counter()
+                new_size = gaussians._xyz.shape[0]
+                print(f"[DENS iter={iteration}] mask={(_t_mask-_t_dens)*1000:.0f}ms  relocate={(_t_rel-_t_mask)*1000:.0f}ms  add_gs={(_t_add-_t_rel)*1000:.0f}ms  total={(_t_add-_t_dens)*1000:.0f}ms  N={new_size}")
+                gc.collect()
+                torch.cuda.empty_cache()
 
             # Optimizer step
             if iteration < opt.iterations:
+                if _profile: torch.cuda.synchronize(); _t5 = time.perf_counter()
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+
+                # Clamp + sanitize immediately after optimizer step so covariance
+                # computation below never sees extreme or NaN/Inf values.
+                gaussians._xyz.data = torch.nan_to_num(gaussians._xyz.data, nan=0.0, posinf=1e4, neginf=-1e4)
+                if hasattr(gaussians, '_scaling'):
+                    gaussians._scaling.data = torch.nan_to_num(torch.clamp(gaussians._scaling.data, min=-15.0, max=8.0), nan=-5.0, posinf=8.0, neginf=-15.0)
+                if hasattr(gaussians, '_rotation'):
+                    rot_bad = ~torch.isfinite(gaussians._rotation.data).all(dim=-1)
+                    if rot_bad.any():
+                        gaussians._rotation.data[rot_bad] = torch.tensor([1.0, 0.0, 0.0, 0.0], device='cuda')
+                # Clamp SH features to prevent unbounded growth (causes rendered
+                # color >> 1 and rising L1 loss when no clamping before loss).
+                if hasattr(gaussians, '_features_dc'):
+                    gaussians._features_dc.data.clamp_(-5.0, 5.0)
+                if hasattr(gaussians, '_features_rest'):
+                    gaussians._features_rest.data.clamp_(-2.0, 2.0)
 
                 L = build_scaling_rotation(gaussians.get_scaling, gaussians.get_rotation)
                 actual_covariance = L @ L.transpose(1, 2)
@@ -174,14 +229,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 #size = len(gaussians.get_texture_alpha)
                 #opacity = gaussians.get_texture_alpha.view(size, -1).mean(1, keepdim=True) * 10 # Rescale to get maximum = 1
-                opacity = torch.ones([gaussians.get_texture_alpha.shape[0], 1], dtype=torch.float32, device="cuda") # Fix opacity to 1 (results in the paper obtained this way)
+                opacity = torch.ones([gaussians._xyz.shape[0], 1], dtype=torch.float32, device="cuda") # Fix opacity to 1 (results in the paper obtained this way)
                 noise = torch.randn_like(gaussians._xyz) * (op_sigmoid(1 - opacity)) * opt.noise_lr * xyz_lr
                 noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
                 gaussians._xyz.add_(noise)
+                gaussians._xyz.data = torch.nan_to_num(gaussians._xyz.data, nan=0.0, posinf=1e4, neginf=-1e4)
+                if _profile: torch.cuda.synchronize(); _t6 = time.perf_counter(); print(f"[PROFILE iter={iteration}]  optimizer+noise={(_t6-_t5)*1000:.1f}ms")
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+        if iteration % 20 == 0:
+            gc.collect()
+
+        _wall_now = time.perf_counter()
+        if iteration % 100 == 0 or iteration <= 5:
+            print(f"[WALL iter={iteration}] total_iter={(_wall_now-_wall_prev)*1000:.0f}ms  N={gaussians._xyz.shape[0]}")
+        _wall_prev = _wall_now
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -227,6 +292,13 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+
+                    if image.shape != gt_image.shape:
+                        min_h = min(image.shape[1], gt_image.shape[1])
+                        min_w = min(image.shape[2], gt_image.shape[2])
+                        image = image[:, :min_h, :min_w]
+                        gt_image = gt_image[:, :min_h, :min_w]
+
                     if tb_writer and (idx < 5):
                         from utils.general_utils import colormap
                         depth = render_pkg["surf_depth"]
@@ -275,7 +347,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_000, 7_000, 10_000, 15_000, 20_000, 25_000, 30_000, 32_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1_000, 7_000, 30_000, 32_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1_000, 7_000, 10_000, 15_000, 20_000, 30_000, 32_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)

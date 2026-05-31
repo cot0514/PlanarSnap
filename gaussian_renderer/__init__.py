@@ -16,7 +16,7 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, additional_return=True):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, additional_return=True, raster_debug=False):
     """
     Render the scene. 
     
@@ -30,13 +30,17 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     except:
         pass
 
+    # Align dimensions to multiples of 16 (required for CUDA 12.8 tile rasterizer)
+    viewpoint_camera.image_height = int(viewpoint_camera.image_height) - (int(viewpoint_camera.image_height) % 16)
+    viewpoint_camera.image_width  = int(viewpoint_camera.image_width)  - (int(viewpoint_camera.image_width)  % 16)
+
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
     raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
+        image_height=viewpoint_camera.image_height,
+        image_width=viewpoint_camera.image_width,
         tanfovx=tanfovx,
         tanfovy=tanfovy,
         bg=bg_color,
@@ -46,13 +50,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
-        debug=False,
-        # pipe.debug
+        debug=raster_debug,
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_xyz
+    means3D = pc.get_xyz.contiguous()
     means2D = screenspace_points
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
@@ -61,10 +64,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     rotations = None
     cov3D_precomp = None
     if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
+        cov3D_precomp = pc.get_covariance(scaling_modifier).contiguous()
     else:
-        scales = pc.get_scaling
-        rotations = pc.get_rotation
+        scales = pc.get_scaling.contiguous()
+        rotations = pc.get_rotation.contiguous()
     
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -73,27 +76,23 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     colors_precomp = None
     if override_color is None:
         if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree.contiguous()+1)**2).contiguous()
+            dir_pp = (pc.get_xyz.contiguous() - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
-            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized).contiguous()
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0).contiguous()
         else:
-            shs = pc.get_features
+            shs = pc.get_features.contiguous()
     else:
-        colors_precomp = override_color
+        colors_precomp = override_color.contiguous()
 
     try:
         means3D.retain_grad()
     except:
         pass
 
-    texture_alpha = pc.get_texture_alpha
-    texture_color = pc.get_texture_color
-
-    start_timer = torch.cuda.Event(enable_timing=True)
-    end_timer = torch.cuda.Event(enable_timing=True)
-    start_timer.record()
+    texture_alpha = pc.get_texture_alpha.contiguous()
+    texture_color = pc.get_texture_color.contiguous()
 
     rendered_image, radii, impact, allmap = rasterizer(
         means3D = means3D,
@@ -107,11 +106,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         cov3D_precomp = cov3D_precomp,
     )
 
-    end_timer.record()
-    torch.cuda.synchronize()
-    start_timer.elapsed_time(end_timer)
-    fps = 1000 / start_timer.elapsed_time(end_timer)
-    
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     rets =  {"render": rendered_image,
@@ -119,7 +113,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "visibility_filter" : impact > 0,
             "radii": radii,
             "impact": impact,
-            "fps": fps,
+            "fps": 0,
     }
 
     if additional_return:

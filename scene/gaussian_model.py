@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 import torch
 from plyfile import PlyData, PlyElement
-from simple_knn._C import distCUDA2
+from scipy.spatial import cKDTree
 from torch import nn
 import torch.nn.functional as F
 import torchvision
@@ -69,7 +69,7 @@ class GaussianModel:
         self.setup_functions()
 
         image = cv2.imread("assets/alpha_init_gaussian_small.png")[..., 0] / 255.0
-        self._texture_alpha_init = torch.tensor([image], dtype=torch.float, device="cuda")
+        self._texture_alpha_init = torch.tensor(np.array([image]), dtype=torch.float, device="cuda").contiguous()
 
     def capture(self):
         return (
@@ -191,13 +191,24 @@ class GaussianModel:
         fused_point_cloud = torch.tensor(total_points).float().cuda()
         RGB_points = torch.tensor(total_colors)
         fused_color = RGB2SH(RGB_points.float().cuda())
+
+        if torch.isnan(fused_point_cloud).any() or torch.isinf(fused_point_cloud).any():
+            print("[WARNING] Point cloud contains NaN or Inf. Cleaning...")
+            fused_point_cloud = torch.nan_to_num(fused_point_cloud)
+
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color - 0.1
         features[:, 3:, 1:] = 0.0
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(total_points).float().cuda()), 0.0000001)
+        # distCUDA2 (simple-knn) causes illegal memory access on CUDA 12.8.
+        # Use CPU-based KDTree to compute nearest-neighbor distances instead.
+        # distCUDA2 returns mean squared distance to k=3 nearest neighbors.
+        # Match that behavior: query k=4 (self + 3 neighbors), average squared distances of the 3 neighbors.
+        kd_tree = cKDTree(np.asarray(total_points))
+        nn_dists, _ = kd_tree.query(np.asarray(total_points), k=4)
+        dist2 = torch.from_numpy(np.maximum(np.mean(nn_dists[:, 1:4] ** 2, axis=1), 1e-7)).float().cuda()
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 2)
         rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda")
 
@@ -243,6 +254,13 @@ class GaussianModel:
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
+        # Exponential decay for scaling and rotation to prevent geometry drift after convergence
+        self.scaling_scheduler_args = get_expon_lr_func(lr_init=training_args.scaling_lr,
+                                                        lr_final=training_args.scaling_lr * 0.1,
+                                                        max_steps=training_args.position_lr_max_steps)
+        self.rotation_scheduler_args = get_expon_lr_func(lr_init=training_args.rotation_lr,
+                                                         lr_final=training_args.rotation_lr * 0.1,
+                                                         max_steps=training_args.position_lr_max_steps)
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -250,7 +268,12 @@ class GaussianModel:
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
-                return lr
+                return_lr = lr
+            elif param_group["name"] == "scaling":
+                param_group['lr'] = self.scaling_scheduler_args(iteration)
+            elif param_group["name"] == "rotation":
+                param_group['lr'] = self.rotation_scheduler_args(iteration)
+        return return_lr
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -276,7 +299,8 @@ class GaussianModel:
         texture_alpha = texture_alpha.detach().cpu().numpy()
 
         texture_alpha = np.round(texture_alpha * 255).astype(np.uint8)
-        texture_color = np.round(texture_color * 255).astype(np.uint8)
+        # Map tanh range (-1,1) to (0,1) before uint8 to avoid sign-flip on wrap-around.
+        texture_color = np.round((texture_color + 1) * 0.5 * 255).astype(np.uint8)
 
         return texture_alpha, texture_color
 
@@ -293,16 +317,21 @@ class GaussianModel:
         texture_alpha = self.inverse_opacity_activation(texture_alpha)
         texture_alpha = nn.Parameter(texture_alpha.requires_grad_(True))
 
+        # Reverse the (tanh+1)*0.5 → [0,1] encoding back to tanh in (-1,1).
         texture_color = torch.tensor(texture_color, dtype=torch.float, device="cuda") / 255
+        texture_color = torch.clamp(texture_color * 2 - 1, -0.9999, 0.9999)
         texture_color = self.inverse_color_activation(texture_color)
         texture_color = nn.Parameter(texture_color.requires_grad_(True))
 
         return texture_alpha, texture_color
 
     def save_texture(self, folder_path):
-        texture_alpha, texture_color = self.compress_texture(self._texture_alpha, self._texture_color)
-        np.savez_compressed(os.path.join(folder_path, "texture_alpha.npz"), texture_alpha=texture_alpha)
-        np.savez_compressed(os.path.join(folder_path, "texture_color.npz"), texture_color=texture_color)
+        # Save raw float32 parameters (lossless — uint8 compression caused -inf→finite
+        # conversion for near-zero alpha texels, introducing spurious billboard contributions)
+        ta_f32 = self._texture_alpha.detach().cpu().numpy().astype(np.float32)
+        tc_f32 = self._texture_color.detach().cpu().numpy().astype(np.float32)
+        np.savez_compressed(os.path.join(folder_path, "texture_alpha.npz"), texture_alpha=ta_f32)
+        np.savez_compressed(os.path.join(folder_path, "texture_color.npz"), texture_color=tc_f32)
 
         indeces = np.random.randint(0, len(self.get_texture_color), 16*16)
 
@@ -342,7 +371,13 @@ class GaussianModel:
         data = np.load(os.path.join(folder_path, "texture_color.npz"))
         texture_color = data["texture_color"]
 
-        self._texture_alpha, self._texture_color = self.decompress_texture(texture_alpha, texture_color)
+        if texture_alpha.dtype == np.float32:
+            # New format: raw logit/atanh parameters saved directly (lossless)
+            self._texture_alpha = nn.Parameter(torch.tensor(texture_alpha, dtype=torch.float, device="cuda").requires_grad_(True))
+            self._texture_color = nn.Parameter(torch.tensor(texture_color, dtype=torch.float, device="cuda").requires_grad_(True))
+        else:
+            # Legacy uint8 format (old checkpoints)
+            self._texture_alpha, self._texture_color = self.decompress_texture(texture_alpha, texture_color)
 
         if self._texture_preproc:
             self._texture_alpha = self.opacity_activation(self._texture_alpha)
@@ -444,17 +479,30 @@ class GaussianModel:
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
+                n_old = stored_state["exp_avg"].shape[0]
+                n_ext = extension_tensor.shape[0]
+                new_shape = (n_old + n_ext,) + stored_state["exp_avg"].shape[1:]
 
-                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0).contiguous()
-                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0).contiguous()
+                new_avg = stored_state["exp_avg"].new_zeros(new_shape)
+                new_avg[:n_old].copy_(stored_state["exp_avg"])
+                del stored_state["exp_avg"]
+                stored_state["exp_avg"] = new_avg
+
+                new_sq = stored_state["exp_avg_sq"].new_zeros(new_shape)
+                new_sq[:n_old].copy_(stored_state["exp_avg_sq"])
+                del stored_state["exp_avg_sq"]
+                stored_state["exp_avg_sq"] = new_sq
 
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).contiguous().requires_grad_(True))
+                group["params"][0] = nn.Parameter(
+                    torch.cat([group["params"][0].data, extension_tensor.detach()], dim=0).requires_grad_(True)
+                )
                 self.optimizer.state[group['params'][0]] = stored_state
-
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).contiguous().requires_grad_(True))
+                group["params"][0] = nn.Parameter(
+                    torch.cat([group["params"][0].data, extension_tensor.detach()], dim=0).requires_grad_(True)
+                )
                 optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
@@ -524,7 +572,7 @@ class GaussianModel:
         new_scaling = self._scaling[idxs].clone()
 
         N_idx = ratio[idxs, :, None] + 1
-        opacity_old = self.get_texture_alpha[idxs]
+        opacity_old = self.opacity_activation(self._texture_alpha[idxs])
         new_alpha_textures = 1.0 - torch.pow(1.0 - opacity_old, 1.0 / N_idx)
 
         new_alpha_textures = self.inverse_opacity_activation(new_alpha_textures)
@@ -553,8 +601,8 @@ class GaussianModel:
             return
 
         # sample from alive ones based on opacity
-        size = len(alive_indices)
-        probs = self.get_texture_alpha[alive_indices].view(size, -1).mean(1)
+        size = alive_indices.shape[0]
+        probs = self.opacity_activation(self._texture_alpha[alive_indices]).view(size, -1).mean(1)
         reinit_idx, ratio = self._sample_alives(alive_indices=alive_indices, probs=probs, num=dead_indices.shape[0])
 
         (
@@ -580,8 +628,8 @@ class GaussianModel:
         if num_gs <= 0:
             return 0
 
-        size = len(self.get_texture_alpha)
-        probs = self.get_texture_alpha.view(size, -1).mean(1)
+        size = self._texture_alpha.shape[0]
+        probs = self.opacity_activation(self._texture_alpha).view(size, -1).mean(1)
         add_idx, ratio = self._sample_alives(probs=probs, num=num_gs)
 
         (

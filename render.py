@@ -187,6 +187,8 @@ if __name__ == "__main__":
     parser.add_argument("--save_planes", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--render_path", action="store_true")
+    parser.add_argument("--zero_texture_color", action="store_true",
+                        help="Zero out texture_color (workaround for old broken compression format)")
     parser.add_argument("--voxel_size", default=0.004, type=float, help='Mesh: voxel size for TSDF')
     parser.add_argument("--depth_trunc", default=3.0, type=float, help='Mesh: Max depth range for TSDF')
     parser.add_argument("--sdf_trunc", default=-1.0, type=float, help='Mesh: truncation value for TSDF')
@@ -200,6 +202,16 @@ if __name__ == "__main__":
     dataset, iteration, pipe = model.extract(args), args.iteration, pipeline.extract(args)
     gaussians = GaussianModel(dataset.sh_degree, texture_preproc=True)
     scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+    with torch.no_grad():
+        # Only sanitize actual NaN/Inf — do not clamp valid scene coordinates or scales.
+        gaussians._xyz.data = torch.nan_to_num(gaussians._xyz.data, nan=0.0, posinf=1e4, neginf=-1e4)
+        if hasattr(gaussians, '_scaling'):
+            gaussians._scaling.data = torch.nan_to_num(gaussians._scaling.data, nan=-5.0, posinf=8.0, neginf=-15.0)
+        # Zero out texture_color if loaded from old broken-compression models
+        # (old format stored tanh*255 as uint8, causing sign-flip on negative values).
+        # Remove this block once all models are saved with the fixed (tanh+1)*0.5 encoding.
+        if hasattr(gaussians, '_texture_color') and args.zero_texture_color:
+            gaussians._texture_color.data.zero_()
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     

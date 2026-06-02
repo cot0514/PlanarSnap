@@ -73,6 +73,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_start.record()
 
         xyz_lr = gaussians.update_learning_rate(iteration)
+        # After densification stops, freeze geometry (xyz/scaling/rotation) to prevent drift.
+        # MCMC converges geometry by iter densify_until_iter; further updates only degrade quality.
+        # Texture (alpha/color) and SH (f_dc/f_rest) continue training for appearance refinement.
+        if iteration >= opt.densify_until_iter:
+            xyz_lr = 0.0
+            for param_group in gaussians.optimizer.param_groups:
+                if param_group["name"] in ("xyz", "scaling", "rotation"):
+                    param_group['lr'] = 0.0
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -130,8 +138,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # loss
         total_loss = loss + dist_loss + normal_loss + textures_reg
-        # For MCMC sampler
-        total_loss += opt.opacity_reg * gaussians.get_texture_alpha.mean()
+        # For MCMC sampler: opacity_reg only active during densification phase.
+        # After densify_until_iter, no MCMC relocation occurs — keeping this penalty
+        # active would keep pushing alpha toward 0, degrading quality past the peak.
+        current_opacity_reg = opt.opacity_reg if iteration < opt.densify_until_iter else 0.0
+        total_loss += current_opacity_reg * gaussians.get_texture_alpha.mean()
         if _profile: torch.cuda.synchronize(); _t3 = time.perf_counter()
         total_loss.backward()
 
@@ -175,10 +186,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            if opt.texture_from_iter <= iteration < opt.texture_to_iter:
+            # Textures are frozen at the same time as densification stops.
+            # Continued texture training after MCMC convergence causes quality degradation
+            # (texture_alpha/color with constant LR oscillates away from the good 10k-iter state).
+            # Only SH (f_dc/f_rest) continues to refine view-dependent appearance after this point.
+            effective_texture_end = min(opt.texture_to_iter, opt.densify_until_iter)
+            if opt.texture_from_iter <= iteration < effective_texture_end:
                 gaussians.activate_texture_training()
 
-            if iteration >= opt.texture_to_iter:
+            if iteration >= effective_texture_end:
                 gaussians.deactivate_texture_training()
 
             if iteration > opt.position_lr_max_steps:

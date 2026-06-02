@@ -186,15 +186,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            # Textures are frozen at the same time as densification stops.
-            # Continued texture training after MCMC convergence causes quality degradation
-            # (texture_alpha/color with constant LR oscillates away from the good 10k-iter state).
-            # Only SH (f_dc/f_rest) continues to refine view-dependent appearance after this point.
-            effective_texture_end = min(opt.texture_to_iter, opt.densify_until_iter)
-            if opt.texture_from_iter <= iteration < effective_texture_end:
+            # Texture LR schedule:
+            # [texture_from_iter, densify_until_iter): full LR (MCMC active phase)
+            # [densify_until_iter, texture_to_iter):  exponential LR decay to 1% of init
+            #   — continued refinement at decaying LR avoids the constant-LR oscillation
+            #     that caused PSNR collapse in v12 (constant LR after MCMC stop).
+            # [texture_to_iter, ...):                 LR = 0 (fully deactivated)
+            if opt.texture_from_iter <= iteration < opt.densify_until_iter:
                 gaussians.activate_texture_training()
-
-            if iteration >= effective_texture_end:
+            elif opt.densify_until_iter <= iteration < opt.texture_to_iter:
+                decay_t = (iteration - opt.densify_until_iter) / max(1, opt.texture_to_iter - opt.densify_until_iter)
+                alpha_lr = opt.texture_opacity_lr * (0.01 ** decay_t)
+                color_lr = opt.texture_color_lr * (0.01 ** decay_t)
+                for param_group in gaussians.optimizer.param_groups:
+                    if param_group["name"] == "texture_alpha":
+                        param_group['lr'] = alpha_lr
+                    elif param_group["name"] == "texture_color":
+                        param_group['lr'] = color_lr
+            elif iteration >= opt.texture_to_iter:
                 gaussians.deactivate_texture_training()
 
             if iteration > opt.position_lr_max_steps:

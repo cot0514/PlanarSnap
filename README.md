@@ -47,11 +47,30 @@ def save_texture(self, folder_path):
 - 초기 학습률 → 30,000 iter에 걸쳐 10%로 감소
 - 수렴 이후 빌보드 지오메트리 드리프트를 효과적으로 억제
 
-### 3. `densify_until_iter` 최적화
+### 3. PSNR 하락 방지: 3단계 수정 체인
 
-기본값 25,000 대신 **10,000**을 권장합니다.
+기본값 `densify_until_iter=25000` 대신 **10,000**을 권장하며, 아래 3가지 수정이 함께 적용됩니다.
 
-v9 학습 결과, PSNR은 iter 10,000에서 ~26 dB로 정점에 도달한 후 iter 32,000까지 ~19.7 dB로 감소했습니다. 원인은 MCMC densification이 수렴 이후에도 계속 새 가우시안을 추가하여 텍스처 초기화가 불량한 프리미티브가 대거 생성되기 때문입니다. `--densify_until_iter 10000`으로 설정하면 iter 32,000까지 ~26 dB를 유지합니다.
+**문제**: room scene에서 PSNR이 iter 10,000(~26 dB 정점) 이후 iter 32,000까지 ~18~19 dB로 지속 하락.
+
+**수정 1** — `opacity_reg`를 MCMC 종료 후 비활성화:  
+`opacity_reg=0.01` 손실 항목이 MCMC 없이 계속 실행되면 모든 billboard alpha를 0으로 밀어냄.
+
+**수정 2** — MCMC 종료 후 geometry(xyz/scaling/rotation) 동결:  
+수렴한 지오메트리가 계속 업데이트되면 불필요한 drift 발생.
+
+**수정 3** — MCMC 종료 시 텍스처(alpha/color)도 동결, 이후 SH(f_dc/f_rest)만 학습:  
+`activate_texture_training()`이 매 iter 텍스처 LR을 초기값으로 리셋하기 때문에, MCMC 종료 후 고정 LR 업데이트가 수렴한 텍스처를 진동시킴.
+
+**v13 결과 (room scene)**:
+
+| Iter | Test PSNR |
+|------|-----------|
+| 10000 | 26.11 dB |
+| 20000 | 26.28 dB |
+| 32000 | 26.34 dB |
+
+최종 metrics: PSNR **26.22** / SSIM **0.8298** / LPIPS **0.2999**
 
 ```bash
 python train.py -s <데이터셋_경로> --model_path=<출력_경로> \

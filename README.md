@@ -62,7 +62,7 @@ def save_texture(self, folder_path):
 **수정 3** — MCMC 종료 시 텍스처(alpha/color)도 동결, 이후 SH(f_dc/f_rest)만 학습:  
 `activate_texture_training()`이 매 iter 텍스처 LR을 초기값으로 리셋하기 때문에, MCMC 종료 후 고정 LR 업데이트가 수렴한 텍스처를 진동시킴.
 
-**v13 결과 (room scene)**:
+**v13 결과 (room scene, cap_max=160k)**:
 
 | Iter | Test PSNR |
 |------|-----------|
@@ -72,9 +72,20 @@ def save_texture(self, folder_path):
 
 최종 metrics: PSNR **26.22** / SSIM **0.8298** / LPIPS **0.2999**
 
+**v15 결과 (room scene, cap_max=200k)**:
+
+| Iter | Test PSNR |
+|------|-----------|
+| 10000 | 26.47 dB |
+| 20000 | 26.61 dB |
+| 32000 | 26.66 dB |
+
+최종 metrics: PSNR **26.54** / SSIM **0.8367** / LPIPS **0.2897**  
+빌보드 수 160k→200k 증가만으로 PSNR +0.32 dB, LPIPS -0.010 개선.
+
 ```bash
 python train.py -s <데이터셋_경로> --model_path=<출력_경로> \
-  --cap_max=160_000 --max_read_points=150_000 --add_sky_box --eval \
+  --cap_max=200_000 --max_read_points=180_000 --add_sky_box --eval \
   --densify_until_iter 10000
 ```
 
@@ -232,7 +243,7 @@ python train.py -s <COLMAP 처리된 데이터셋 경로> \
 
 | 데이터셋 | `--cap_max` | `--max_read_points` | 추가 플래그 |
 |---|---|---|---|
-| Mip-NeRF-360 실내 (room, bonsai, counter, kitchen) | 160,000 | 150,000 | `--add_sky_box --eval --densify_until_iter 10000` |
+| Mip-NeRF-360 실내 (room, bonsai, counter, kitchen) | 200,000 | 180,000 | `--add_sky_box --eval --densify_until_iter 10000` |
 | Mip-NeRF-360 실외 (bicycle, stump, garden) | 300,000 | 290,000 | `--add_sky_box --eval --densify_until_iter 10000` |
 | Tanks & Temples | 300,000 | 290,000 | `--add_sky_box --eval --densify_until_iter 10000` |
 | DTU | 60,000 | 60,000 | `--lambda_normal=0.05 --lambda_dist 100 --eval` |

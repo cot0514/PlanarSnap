@@ -44,7 +44,7 @@ python visualize.py -m <모델_경로> -s <데이터셋_경로>
 
 | 데이터셋 유형 | `--cap_max` | `--max_read_points` | 추가 플래그 |
 |---|---|---|---|
-| Mip-NeRF-360 실내 (room, bonsai, counter, kitchen) | 160,000 | 150,000 | `--add_sky_box --eval` |
+| Mip-NeRF-360 실내 (room, bonsai, counter, kitchen) | 200,000 | 180,000 | `--add_sky_box --eval` |
 | Mip-NeRF-360 실외 (bicycle, stump, garden) | 300,000 | 290,000 | `--add_sky_box --eval` |
 | Tanks & Temples | 300,000 | 290,000 | `--add_sky_box --eval` |
 | DTU | 60,000 | 60,000 | `--lambda_normal=0.05 --lambda_dist 100 --eval` |
@@ -175,7 +175,7 @@ if iteration >= effective_texture_end:
 ```
 원인: `activate_texture_training()`이 매 iter 텍스처 LR을 초기값으로 **리셋**. MCMC 종료 후에도 고정 LR로 업데이트되면 수렴한 텍스처가 진동하여 품질 저하.
 
-**v13 결과 (room scene)**:
+**v13 결과 (room scene, cap_max=160k)**:
 | Iter | Test PSNR |
 |------|-----------|
 | 10000 | 26.11 dB |
@@ -192,6 +192,27 @@ PSNR이 iter 10000 이후 지속 상승 — 하락 문제 완전 해결.
 | 10000 | 25.93 | 25.97 | 26.01 | 26.11 |
 | 20000 | — | 23.01 | 22.79 | 26.28 |
 | 32000 | 19.70 | 18.53 | 18.34 | **26.34** |
+
+### `cap_max` 증가 (v15)
+
+빌보드 수를 늘리면 씬 커버리지가 세밀해져 품질이 개선됨. 실내 씬 기준 160k → 200k 변경 결과:
+
+**v15 결과 (room scene, cap_max=200k)**:
+| Iter | Test PSNR |
+|------|-----------|
+| 10000 | 26.47 dB |
+| 20000 | 26.61 dB |
+| 32000 | **26.66 dB** |
+
+렌더링 최종 metrics: PSNR **26.54** / SSIM **0.8367** / LPIPS **0.2897**
+
+| 지표 | v13 (160k) | v15 (200k) | 개선 |
+|------|-----------|-----------|------|
+| PSNR | 26.22 | **26.54** | +0.32 dB |
+| SSIM | 0.8298 | **0.8367** | +0.007 |
+| LPIPS | 0.2999 | **0.2897** | -0.010 |
+
+→ 실내 씬 권장 파라미터: `--cap_max=200_000 --max_read_points=180_000`
 
 ## CUDA 12.8 / WSL2 호환성 수정
 

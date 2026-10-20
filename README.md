@@ -214,7 +214,18 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" /v TdrLevel /t R
 │   ├── dtu_eval.py                 # DTU Chamfer distance 평가
 │   ├── train_all.sh                # 모든 씬 학습
 │   ├── render_all.sh               # 모든 씬 렌더링
-│   └── metrics_all.sh              # 모든 씬 메트릭 계산
+│   ├── metrics_all.sh              # 모든 씬 메트릭 계산
+│   ├── depth_fusion.py             # (PlanarSnap) 렌더링 깊이 → 조밀 점군
+│   ├── hybrid_planes.py            # (PlanarSnap) depth 평면을 빌보드로 정밀화
+│   ├── analyze_walls.py            # (PlanarSnap) 벽/방향/수직쌍 집계
+│   ├── replica_to_colmap.py        # (PlanarSnap) Replica → COLMAP 변환
+│   ├── gt_depth_fusion.py          # (PlanarSnap) GT depth 오라클 점군
+│   ├── eval_normals_gt.py          # (PlanarSnap) GT 노멀 정확도
+│   ├── eval_walls_gt.py            # (PlanarSnap) GT 벽 검출
+│   ├── eval_wall_geometry_gt.py    # (PlanarSnap) GT 벽 평면 기하
+│   ├── eval_coverage_gt.py         # (PlanarSnap) 클래스별 표면 커버리지
+│   ├── run_replica_scene.sh        # (PlanarSnap) 한 씬 전체 파이프라인
+│   └── summarize_replica.py        # (PlanarSnap) 5씬 결과 집계
 ├── submodules
 │   ├── diff-bbsplat-rasterization  # BBSplat 레스터라이저 CUDA 구현
 │   └── simple-knn                  # KNN CUDA 구현
@@ -226,7 +237,9 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" /v TdrLevel /t R
 ├── render.py                       # 새로운 시점 합성
 ├── metrics.py                      # 메트릭 계산
 ├── visualize.py                    # 인터랙티브 씬 시각화
-├── segment_planes.py               # (PlanarSnap) 빌보드 기반 평면 분할
+├── docs
+│   └── planarsnap_notion.md        # (PlanarSnap) 연구 전체 정리 문서
+├── segment_planes.py               # (PlanarSnap) 평면 분할 (빌보드/depth 점군)
 ├── save_from_checkpoint.py         # 학습 체크포인트에서 point_cloud 저장
 └── test_psnr.py                    # PSNR 진단 스크립트 (preproc=False vs True 비교)
 ```
@@ -381,18 +394,27 @@ python visualize.py -m <모델 경로> -s <데이터셋 경로>
 
 ## 평면 분할 (PlanarSnap)
 
-학습된 모델의 빌보드를 물리적 표면 단위로 묶습니다.
+학습된 모델에서 벽·바닥 같은 평면 구조를 복원합니다.
 
 ```bash
-python segment_planes.py -m <모델_경로> --save
+# 빌보드 점군 기반 (기본)
+python segment_planes.py -m <모델_경로> --method pca --save
+
+# 렌더링 깊이 맵 기반 (권장 — 벽 복구가 2배 이상)
+python scripts/depth_fusion.py -m <모델_경로> -s <데이터셋_경로> \
+    --voxel 0.05 --clip_billboards 0.3 --out <모델_경로>/depth_cloud.ply
+python segment_planes.py -m <모델_경로> --depth_cloud <모델_경로>/depth_cloud.npz \
+    --method pca --no_skybox_filter --save
 ```
+
+빌보드는 무늬를 따라 배치되어 민벽에 희박하므로, 깊이 맵을 역투영한 점군을 쓰는 쪽이 훨씬 잘 동작합니다([아래](#depth-맵-활용--빌보드-배치-편향-극복)).
 
 ### 파이프라인
 
 1. **기하 분할** — 반복적 RANSAC 평면 피팅 후, 방향은 같지만 공간적으로 떨어진 표면을 DBSCAN으로 분리. `--method pca` 권장 (아래 참조).
 2. **동일 평면 병합** (`--merge_angle`, `--merge_dist`) — RANSAC이 같은 벽/바닥을 여러 조각으로 나눈 경우를 다시 합침.
 3. **색상 분할** (`--color_*`) — 기하학적으로 같은 평면이지만 재질이 다른 경우 분리(바닥에 깔린 러그 등). 실제 학습 사진을 빌보드에 투영해 색을 얻고, 음영에 둔감한 특징 공간에서 클러스터링.
-4. **레이블 평활화** (`--smooth_k`) — 경계면의 salt-and-pepper 오분류 정리.
+4. **레이블 평활화** (`--smooth_k`) — 경계면의 salt-and-pepper 오분류 정리. **기본값 0(끔)** — 평면성 제약이 없어 기하를 깎기 때문입니다(아래 주의 참조).
 
 `--method normal`(노멀 방향 클러스터링)도 있지만 권장하지 않습니다. 위 [5번 항목](#5-빌보드-노멀-벡터-정확도-수정-planarsnap) 참조.
 
@@ -402,24 +424,70 @@ python segment_planes.py -m <모델_경로> --save
 
 더 큰 문제는 RANSAC이 inlier를 찾는 즉시 제거한다는 점입니다. 유령 슬랩이 **뒤에 있는 벽의 점들을 먼저 가져가 버립니다.**
 
-room 장면에는 벽이 최소 5방향 존재합니다(위에서 본 평면에 선을 맞춰 독립 검증: yaw 74°/18°/142°/20°/36°, 각각 3D 평면 잔차 0.041~0.048, 높이 범위 1.7~2.2). 그런데 `--method ransac`은 yaw 15~30° 계열 하나만 찾아냅니다.
-
-**수정**: 점의 **국소 표면 노멀**(점구름의 k-NN PCA로 계산 — 빌보드에 저장된 노멀이 아님)이 평면 노멀과 일치할 때만 inlier로 인정합니다. 유령 슬랩은 inlier들의 노멀이 제각각이라 걸러지고, 가려져 있던 벽들이 복원됩니다.
+**수정**: 점의 **국소 표면 노멀**(점구름의 k-NN PCA로 계산 — 빌보드에 저장된 노멀이 아님)이 평면 노멀과 일치할 때만 inlier로 인정합니다. 유령 슬랩은 inlier들의 노멀이 제각각이라 걸러집니다.
 
 ```bash
 python segment_planes.py -m <모델_경로> --method pca
 ```
 
-| | 평면(≥300점) | 할당률 | 잔차 초과 평면 | 검출된 벽 | 벽 방향 종류 |
+Replica 5씬 GT 기준(벽 인스턴스 26개), 빌보드 점군에 대해:
+
+| | GT 벽 복구 | 평면 기하 매칭 | 각도 오차 | 할당률 |
+|---|---|---|---|---|
+| `--method ransac` | 7/26 | 7/26 | 0.43° | 83% |
+| `--method pca` | 7/26 | **9/26** | **0.31°** | 62% |
+
+> **트레이드오프**: 할당률이 83% → 62%로 떨어집니다. 국소 이웃이 평면이 아닌 잡동사니(화분, 쿠션 등)가 제외되기 때문이며, 평면 분할 목적에서는 오히려 올바른 동작입니다. 엄격도는 `--normal_angle`로 조절합니다(기본 45°).
+
+> **주의 — 과거 수치 정정**: 이전 README는 room 장면에서 `--method pca`가 벽 19개·방향 11종을 복원한다고 기록했습니다. 그 측정은 up 축과 바닥 높이 추정에 결함이 있던 분석 스크립트로 얻은 값이라 **신뢰할 수 없습니다**(수정 후 같은 장면이 벽 5개·방향 4종). 위 표는 GT가 있는 Replica에서 수정된 도구로 다시 측정한 값입니다. **노멀 제약의 이점은 벽 "개수"보다 평면 품질 쪽에 있습니다.**
+
+> **평활화 주의**: `smooth_labels_knn`은 평면성 제약 없이 k-NN 다수결만 하므로 기하 정확도를 깎습니다. 바닥의 높이 범위를 0.70 → 3.39로 부풀리고 잔차 초과 평면을 4 → 15개로 늘립니다. 이 때문에 **기본값을 0(끔)으로 바꿨습니다.**
+
+### depth 맵 활용 — 빌보드 배치 편향 극복
+
+**문제**: MCMC densification은 **렌더링 오차가 큰 곳**에 프리미티브를 추가합니다. 평평한 단색 벽은 빌보드 하나로도 잘 재현되므로 추가되지 않습니다. 그 결과 평면 분할에 꼭 필요한 표면이 가장 비어 있습니다.
+
+Replica 5씬에서 GT 메시 표면을 면적 균등 샘플링해 5 cm 안에 빌보드가 있는 비율을 측정했습니다:
+
+| 천장 | 벽 | 바닥 | 소파 | 카펫 | 쿠션 |
 |---|---|---|---|---|---|
-| `--method ransac` | 26 | 83% | 4 | 6 | **2** |
-| ransac + 평활화 | 25 | 86% | **15** | 6 | **2** |
-| `--method pca` | 36 | 54% | 2 | **19** | **11** |
-| pca + 평활화 | 28 | 57% | 2 | 15 | 8 |
+| **8.9%** | **27.5%** | **30.9%** | 44.8% | 70.3% | **86.0%** |
 
-> **트레이드오프**: 할당률이 83% → 54%로 떨어집니다. 국소 이웃이 평면이 아닌 잡동사니(화분, 쿠션 등)가 제외되기 때문이며, 평면 분할 목적에서는 오히려 올바른 동작입니다. 엄격도는 `--normal_angle`로 조절합니다(기본 45°, 25°로 낮추면 37%만 할당).
+순서가 정확히 뒤집혀 있습니다. room0에서는 이 때문에 빌보드 기반 분할이 **벽을 하나도 찾지 못했습니다**(바닥 평면이 방 길이 7.76 m 중 4.66 m만, 최대 수직 평면이 벽 높이 2.81 m 중 1.68 m만 덮음).
 
-> **평활화 주의**: `smooth_labels_knn`은 평면성 제약 없이 k-NN 다수결만 하므로 기하 정확도를 깎습니다. `--method ransac`에서는 바닥의 높이 범위를 0.70 → 3.39로 부풀리고 잔차 초과 평면을 4 → 15개로 늘립니다. `--method pca`에서는 복원한 벽 방향 11종 중 3종을 잃습니다. 구조가 중요하면 `--smooth_k 0`을 쓰세요.
+**해결**: 학습된 모델로 모든 학습 뷰를 렌더링해 **깊이 맵을 역투영**합니다. 화면의 모든 픽셀이 점 하나를 만들므로 민벽도 균등하게 채워집니다.
+
+```bash
+# 1) 렌더링 깊이 → 조밀 점군 (5 cm 복셀)
+python scripts/depth_fusion.py -m <모델_경로> -s <데이터셋_경로> \
+    --voxel 0.05 --pixel_stride 2 --clip_billboards 0.3 \
+    --out <모델_경로>/depth_cloud.ply
+
+# 2) 그 점군을 분할 (깊이 노멀이 제약으로 쓰임)
+python segment_planes.py -m <모델_경로> --depth_cloud <모델_경로>/depth_cloud.npz \
+    --method pca --no_skybox_filter --save
+```
+
+Replica 5씬 GT 기준(벽 인스턴스 26개):
+
+| 점 집합 + 방법 | GT 벽 복구 | 평면 기하 매칭 | 각도 오차 | 점 IoU |
+|---|---|---|---|---|
+| 빌보드 + `ransac` (기존) | 7/26 | 7/26 | 0.43° | 16.4% |
+| 빌보드 + `pca` | 7/26 | 9/26 | 0.31° | 18.1% |
+| depth + `ransac` | 16/26 | 19/26 | 2.23° | 42.4% |
+| **depth + `pca`** | **17/26** | 19/26 | 1.90° | **44.4%** |
+| 혼합 (`hybrid_planes.py`) | 16/26 | **20/26** | **1.17°** | 42.1% |
+| GT depth (오라클, 상한) | 18/26 | 20/26 | 0.11° | 67.1% |
+
+> **상한의 존재**: 완벽한 깊이로도 18/26입니다. GT 벽 8개는 궤적이 관측하지 못해 원리적으로 복구 불가합니다. 따라서 17/26은 **현실적 상한의 94%** 입니다.
+
+> **이득의 출처는 점 개수가 아닙니다.** Replica에서 depth 점군은 빌보드보다 **오히려 적습니다**(0.27~0.87배). 결정적인 것은 **그 표면에 점이 있느냐**입니다. 실촬영 데이터(drjohnson)에서도 벽 9 → 20개, 방향 2 → 4종으로 같은 경향이 나옵니다.
+
+> **정확도와 커버리지의 상충**: 빌보드는 위치가 정확하지만(GT 표면 10 cm 이내 96.5~99.5%) 커버리지가 낮고, depth는 반대(53.9~67.9%)입니다. `scripts/hybrid_planes.py`가 둘을 결합해 기하 매칭 20/26으로 오라클과 동률이면서 각도 1.17°를 유지합니다.
+
+**개별 노멀 오차는 병목이 아닙니다.** 빌보드 개별 노멀은 GT 대비 20.7~25.6° 어긋나지만, 그 점들로 피팅한 **평면 법선은 0.31~1.17°** 입니다. 수천 점을 피팅하면 독립 노이즈가 평균되기 때문입니다.
+
+전체 실험 설계·근본 원인 분석·한계는 [`docs/planarsnap_notion.md`](docs/planarsnap_notion.md)에 정리돼 있습니다.
 
 ### 동일 평면 병합의 연쇄 드리프트 버그 (수정됨)
 

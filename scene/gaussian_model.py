@@ -66,6 +66,7 @@ class GaussianModel:
         self._texture_is_active = False
         self._gaussians_is_active = True
         self._texture_preproc = texture_preproc
+        self.rotation_init = "rand"
         self.setup_functions()
 
         image = cv2.imread("assets/alpha_init_gaussian_small.png")[..., 0] / 255.0
@@ -173,6 +174,22 @@ class GaussianModel:
 
         return np.asarray(points)
 
+    @staticmethod
+    def pca_normal_rotations(points, k=20):
+        """Quaternions (w,x,y,z) whose local Z axis (the billboard normal) is the local PCA surface normal."""
+        pts = np.asarray(points, dtype=np.float64)
+        _, nbr = cKDTree(pts).query(pts, k=k)
+        local = pts[nbr] - pts[nbr].mean(axis=1, keepdims=True)
+        cov = np.einsum('nki,nkj->nij', local, local)
+        normals = np.linalg.eigh(cov)[1][:, :, 0]
+        # normal sign is arbitrary; keeping n_z >= 0 avoids the z -> -z singularity
+        normals[normals[:, 2] < 0] *= -1
+        # shortest rotation taking (0,0,1) to n: q ~ (1 + z.n, z x n)
+        q = np.concatenate([1.0 + normals[:, 2:3], -normals[:, 1:2], normals[:, 0:1],
+                            np.zeros((len(pts), 1))], axis=1)
+        q /= np.linalg.norm(q, axis=1, keepdims=True)
+        return torch.tensor(q, dtype=torch.float32, device="cuda")
+
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, add_sky_box: bool, sphere_point: int=10000):
         self.spatial_lr_scale = spatial_lr_scale
         pcd_points = np.asarray(pcd.points)
@@ -210,7 +227,13 @@ class GaussianModel:
         nn_dists, _ = kd_tree.query(np.asarray(total_points), k=4)
         dist2 = torch.from_numpy(np.maximum(np.mean(nn_dists[:, 1:4] ** 2, axis=1), 1e-7)).float().cuda()
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 2)
-        rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda")
+        if self.rotation_init == "pca":
+            rots = self.pca_normal_rotations(total_points)
+            print("Billboard rotations initialised from local PCA normals")
+        else:
+            # NOTE: all-positive quaternion components are not uniform on SO(3); normals end up
+            # clustered around the world +X axis (mean vector ~(0.72, 0, 0)).
+            rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda")
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))

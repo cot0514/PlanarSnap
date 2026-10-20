@@ -85,6 +85,8 @@ class OptimizationParams(ParamGroup):
         self.lambda_dssim = 0.2
         self.lambda_dist = 0.0
         self.lambda_normal = 0.0
+        self.normal_from_iter = 7000
+        self.rotation_init = "rand"
         self.lambda_texture_value = 0.0001
         self.lambda_alpha_value = 0.0001
         self.max_impact_threshold = 100

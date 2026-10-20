@@ -45,6 +45,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
+    gaussians.rotation_init = opt.rotation_init
     scene = Scene(dataset, gaussians, add_sky_box=opt.add_sky_box, max_read_points=opt.max_read_points, sphere_point=opt.sphere_point)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -121,7 +122,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_map.mean())
 
         # regularization
-        lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
+        lambda_normal = opt.lambda_normal if iteration > opt.normal_from_iter else 0.0
         lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
 
         rend_dist = render_pkg["rend_dist"]

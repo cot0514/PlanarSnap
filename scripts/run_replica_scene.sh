@@ -134,6 +134,14 @@ if [ -f "$SEM/mesh_semantic.ply" ]; then
     $PY scripts/eval_floor_gt.py --walls "$OUT/walls_$arm.json" --semantic "$SEM" \
         --json "$OUT/floor_$arm.json" | head -2
   done
+  say "room polygon + GT footprint"
+  for arm in $ARMS; do
+    echo "--- $arm"
+    $PY scripts/room_polygon.py --labeled "$PC/planes_$arm.ply" --walls "$OUT/walls_$arm.json" \
+        --json "$OUT/room_$arm.json" --png "$OUT/room_$arm.png" | grep -E "wall lines"
+    $PY scripts/eval_footprint_gt.py --room "$OUT/room_$arm.json" --semantic "$SEM" \
+        --json "$OUT/footprint_$arm.json" | head -1
+  done
   say "GT wall detection (point level)"
   for arm in $ARMS; do
     echo "--- $arm"

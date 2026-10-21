@@ -118,6 +118,12 @@ $PY scripts/eval_normals_gt.py -m "$OUT" --mesh "$MESH" --unseen "$UNSEEN" \
 
 SEM=$ROOT/data/replica/official/semantic/$(echo "$SCENE" | sed -E 's/([a-z]+)([0-9]+)/\1_\2/')/habitat
 if [ -f "$SEM/mesh_semantic.ply" ]; then
+  say "GT up / floor height"
+  for arm in $ARMS; do
+    echo "--- $arm"
+    $PY scripts/eval_floor_gt.py --walls "$OUT/walls_$arm.json" --semantic "$SEM" \
+        --json "$OUT/floor_$arm.json" | head -2
+  done
   say "GT wall detection (point level)"
   for arm in $ARMS; do
     echo "--- $arm"

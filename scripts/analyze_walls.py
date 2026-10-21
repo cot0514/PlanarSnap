@@ -14,6 +14,13 @@ views), not from the coordinate axes: a COLMAP frame is not gravity-aligned, so
 does not work either -- a room has many more wall planes than floor planes, so
 the walls outvote the floor.
 
+The camera estimate is only a seed, though: handheld trajectories look slightly
+down and roll, so the mean camera up sits 4-9 deg off gravity on Replica, which
+over a 5 m room moves "height" by up to 0.6 m.  `refine_up` then tightens it
+from the planes themselves -- up should be parallel to the horizontal planes'
+normals and perpendicular to the vertical ones' -- which brings it to within
+0.1-3.2 deg of the GT mesh's up on all five Replica scenes and every point set.
+
 The wall test is the one the README documents: a plane counts as an
 architectural wall when it is near-vertical, reaches down close to the floor,
 spans enough height, and is long enough to be a wall rather than a furniture
@@ -67,6 +74,40 @@ def up_auto(fits):
     return e, score
 
 
+def plane_area(q, cell=0.1):
+    """Area a plane covers, as occupied cells of its own 2-D basis.  A point
+    count is not an area: billboard centres and fused depth pixels sample
+    surfaces at very different densities."""
+    c = q.mean(0)
+    vt = np.linalg.svd(q - c, full_matrices=False)[2]
+    k = np.floor(np.stack([(q - c) @ vt[0], (q - c) @ vt[1]], 1) / cell).astype(np.int64)
+    return len(np.unique(k, axis=0)) * cell * cell
+
+
+def refine_up(up0, normals, areas, schedule=(12, 8, 5, 3)):
+    """
+    Up as the direction most parallel to the horizontal planes' normals and
+    most perpendicular to the vertical planes', area-weighted: the smallest
+    eigenvector of  sum_vert A n n^T - sum_horiz A n n^T.  Which planes count
+    as horizontal or vertical depends on up itself, so the tolerance shrinks
+    over a few rounds starting from the camera seed; a single wide round lets
+    tilted furniture and stair-like fragments pull it off (mean error 1.4 deg
+    vs 0.8 deg coarse-to-fine on Replica).
+    """
+    up = up0.copy()
+    for tol in schedule:
+        M = np.zeros((3, 3))
+        for n, w in zip(normals, areas):
+            c = abs(float(n @ up))
+            if c > np.cos(np.radians(tol)):
+                M -= w * np.outer(n, n)
+            elif c < np.sin(np.radians(tol)):
+                M += w * np.outer(n, n)
+        u = np.linalg.eigh(M)[1][:, 0]
+        up = u if u @ up0 > 0 else -u
+    return up
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--labeled", required=True)
@@ -80,13 +121,19 @@ def main():
     ap.add_argument("--min_length", type=float, default=2.0)
     ap.add_argument("--yaw_tol", type=float, default=10.0)
     ap.add_argument("--perp_tol", type=float, default=10.0)
+    ap.add_argument("--no_refine_up", action="store_true",
+                    help="use the camera (or given) up as is, the old behaviour")
+    ap.add_argument("--floor_min_area", type=float, default=1.0,
+                    help="smallest horizontal plane (m^2) that may be the floor")
+    ap.add_argument("--floor_cap_margin", type=float, default=0.15,
+                    help="replace the floor plane by the wall-bottom bound only "
+                         "when the plane sits this far above it; wall bottoms "
+                         "scatter a few cm under a correctly found floor "
+                         "(drjohnson: 7-14 cm)")
     ap.add_argument("--floor_height", type=float, default=None,
                     help="use this floor height (along up) instead of estimating "
-                         "it. The estimate picks the largest low horizontal plane, "
-                         "which lands on a table or sofa top when the real floor "
-                         "is hidden or sparsely covered (0.6-0.7 m high on room1 "
-                         "billboards and office1). Passing one shared value lets "
-                         "different point sets be judged against the same floor")
+                         "it. Passing one shared value lets different point sets "
+                         "be judged against the same floor")
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
 
@@ -100,6 +147,7 @@ def main():
         c = q.mean(0)
         n = np.linalg.svd(q - c, full_matrices=False)[2][-1]
         fits[i] = (c, n / np.linalg.norm(n), q)
+    areas = {i: plane_area(q) for i, (_, _, q) in fits.items()}
 
     if a.up_vec:
         up = np.array([float(x) for x in a.up_vec.split(",")]); up /= np.linalg.norm(up)
@@ -110,6 +158,11 @@ def main():
     else:
         up, _ = up_auto(fits)
         print(f"up (auto, axis) = {np.round(up,3)}   -- pass --cameras for a better estimate")
+    up_seed = up
+    if not a.no_refine_up:
+        up = refine_up(up_seed, [fits[i][1] for i in ids], [areas[i] for i in ids])
+        tilt = np.degrees(np.arccos(min(1.0, abs(float(up @ up_seed)))))
+        print(f"up (refined)    = {np.round(up,3)}   ({tilt:.1f} deg from the seed)")
 
     # orthonormal basis of the horizontal plane, for heights and yaw angles
     seed = np.array([1.0, 0, 0]) if abs(up[0]) < 0.9 else np.array([0, 1.0, 0])
@@ -118,33 +171,52 @@ def main():
 
     heights = {i: q @ up for i, (_, _, q) in fits.items()}
 
-    # Robust floor height.  Taking the minimum over all planes is not safe: a
-    # single spurious plane below the floor sets the reference and then every
-    # real wall fails the "reaches the floor" test.  On drjohnson at a 5 cm
-    # fusion voxel the lowest planes run 1.9 m under the floor and that
-    # rejected all 24 walls.  So find the actual floor instead: the largest
-    # near-horizontal plane sitting in the lower half of the scene, and take
-    # its median height.
+    # Floor height.  Three things go wrong with simpler rules:
+    #   * the minimum over all planes -- one spurious plane below the floor
+    #     (drjohnson, 1.9 m under it at a 5 cm fusion voxel) rejects every wall;
+    #   * the largest low horizontal plane -- when the floor is hidden or
+    #     sparsely covered it is a table or bed top (0.7-0.9 m high on room1
+    #     billboards, 0.3 m on office0 depth);
+    #   * the floor plane may not exist at all: office1's rendered depth holds
+    #     ~2 m^2 of floor spread over +-0.3 m, which never becomes a plane.
+    # So: the LOWEST horizontal plane of real size (>= floor_min_area and a
+    # quarter of the largest one, which keeps small spurious planes from below
+    # the floor out), capped by where the large vertical planes end -- walls
+    # stand on the floor, so it cannot be well above most of their bottoms.
     all_h = np.concatenate([h for h in heights.values()])
     lo, hi = np.percentile(all_h, 0.5), np.percentile(all_h, 99.5)
     mid = 0.5 * (lo + hi)
     cos_h = np.cos(np.radians(a.vertical_deg))
-    cands = [(len(q), int(i), float(np.median(heights[i])))
+    cands = [(areas[i], int(i), float(np.median(heights[i])))
              for i, (c, n, q) in fits.items()
              if abs(float(n @ up)) > cos_h and np.median(heights[i]) < mid]
+    if cands:
+        min_a = max(a.floor_min_area, 0.25 * max(c[0] for c in cands))
+        cands = [c for c in cands if c[0] >= min_a]
+    bottoms = [float(np.percentile(heights[i], 2)) for i, (c, n, q) in fits.items()
+               if abs(float(n @ up)) < np.sin(np.radians(a.vertical_deg))
+               and areas[i] >= a.floor_min_area]
+    wall_cap = float(np.percentile(bottoms, 10)) if bottoms else None
+    floor_src = "given"
     if a.floor_height is not None:
         floor_h, floor_id = float(a.floor_height), None
         print(f"floor height given: {floor_h:.2f}")
     elif cands:
-        cands.sort(reverse=True)
-        _, floor_id, floor_h = cands[0]
-        print(f"floor plane = id {floor_id} ({cands[0][0]:,} pts), "
+        floor_a, floor_id, floor_h = min(cands, key=lambda c: c[2])
+        floor_src = "plane"
+        print(f"floor plane = id {floor_id} ({floor_a:.1f} m^2), "
               f"median height {floor_h:.2f}")
     else:
         floor_h = float(np.percentile(all_h, 1.0))
-        floor_id = None
+        floor_id, floor_src = None, "percentile"
         print(f"no horizontal plane found low in the scene; "
               f"using the 1st percentile of all heights, {floor_h:.2f}")
+    if a.floor_height is None and wall_cap is not None \
+            and floor_h - wall_cap > a.floor_cap_margin:
+        print(f"  ...but {len(bottoms)} large vertical planes end lower (10th pct "
+              f"of their bottoms {wall_cap:.2f}); the floor plane is furniture or "
+              f"a platform, using {wall_cap:.2f}")
+        floor_h, floor_id, floor_src = wall_cap, None, "wall_bottoms"
     print(f"scene height range {lo:.2f} .. {hi:.2f} along up")
 
     walls, rows = [], []
@@ -210,8 +282,9 @@ def main():
     if a.json:
         with open(a.json, "w") as f:
             json.dump({"labeled": a.labeled, "n_points": len(xyz), "n_planes": len(ids),
-                       "up": up.tolist(), "floor_height": floor_h,
-                       "floor_plane_id": floor_id, "walls": len(walls),
+                       "up": up.tolist(), "up_seed": up_seed.tolist(),
+                       "floor_height": floor_h, "floor_plane_id": floor_id,
+                       "floor_source": floor_src, "walls": len(walls),
                        "wall_ids": [int(i) for i, _, _ in walls],
                        "orientations": [{"yaw": c["yaw"], "ids": c["ids"]} for c in clusters],
                        "perpendicular_orientation_pairs": len(perp),

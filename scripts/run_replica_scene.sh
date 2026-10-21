@@ -101,7 +101,17 @@ $PY segment_planes.py -m "$OUT" --depth_cloud "$OUT/gtdepth.npz" --method pca \
     --no_skybox_filter --no_color_split --no_vis --save 2>&1 | grep -E "Planes detected|Assigned "
 mv "$PC/planes.ply" "$PC/planes_gtdepth.ply"
 
-ARMS="bb_ransac bb_pca depth_ransac depth_pca hybrid gtdepth"
+BASE="bb_ransac bb_pca depth_ransac depth_pca hybrid gtdepth"
+
+# --- floorplan step 1: merge each wall's fragments into one plane.  Applied
+# to every arm, oracle included, so the *_cons arms compare like for like ---
+say "consolidate walls"
+for arm in $BASE; do
+  $PY scripts/consolidate_walls.py --labeled "$PC/planes_$arm.ply" \
+      --cameras "$OUT/cameras.json" --out "$PC/planes_${arm}_cons.ply" | grep -E "^merge"
+done
+
+ARMS="$BASE $(for x in $BASE; do printf '%s_cons ' $x; done)"
 
 say "walls"
 for arm in $ARMS; do

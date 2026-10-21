@@ -46,6 +46,8 @@ def main():
                     help="a predicted plane beyond this angle is not the wall")
     ap.add_argument("--max_offset", type=float, default=0.30,
                     help="metres between the two planes, measured at the GT wall's centroid")
+    ap.add_argument("--min_area", type=float, default=0.5,
+                    help="ignore degenerate GT wall labels smaller than this (m^2)")
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
 
@@ -66,7 +68,8 @@ def main():
             preds[pid] = fit(xyz[m])
     print(f"{len(preds)} predicted wall planes; GT walls:")
 
-    gt_ids = np.unique(tri_oid[tri_cls == "wall"])
+    gt_ids = np.array([g for g in np.unique(tri_oid[tri_cls == "wall"])
+                       if area[(tri_oid == g) & (tri_cls == "wall")].sum() >= a.min_area])
     out, matched = [], 0
     print(f"\n{'GT id':>6} {'area m2':>8} {'match':>6} {'angle':>8} {'offset':>9}")
     for g in gt_ids:

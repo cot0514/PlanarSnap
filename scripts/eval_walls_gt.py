@@ -59,6 +59,12 @@ def main():
     ap.add_argument("--min_overlap", type=float, default=0.25,
                     help="fraction of a GT wall instance's held points that a "
                          "predicted plane must cover to count as recovering it")
+    ap.add_argument("--min_area", type=float, default=0.5,
+                    help="ignore GT wall instances smaller than this (m^2). "
+                         "Replica's semantic mesh carries a few degenerate wall "
+                         "labels of 2-82 triangles and <0.01 m^2 (room0 #23, "
+                         "room1 #38/#47, office0 #18); the next smallest real "
+                         "wall is 2.07 m^2")
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
 
@@ -115,7 +121,16 @@ def main():
     # number that happen to appear among this arm's scored points -- otherwise
     # an arm that covers less of the room gets an easier denominator and the
     # arms cannot be compared.
-    scene_inst = np.unique(tri_oid[tri_cls == "wall"])
+    tri_area = 0.5 * np.linalg.norm(np.cross(verts[tris[:, 1]] - verts[tris[:, 0]],
+                                             verts[tris[:, 2]] - verts[tris[:, 0]]), axis=1)
+    cand = np.unique(tri_oid[tri_cls == "wall"])
+    inst_area = {int(i): float(tri_area[(tri_oid == i) & (tri_cls == "wall")].sum()) for i in cand}
+    scene_inst = np.array([i for i in cand if inst_area[int(i)] >= a.min_area])
+    dropped = [int(i) for i in cand if inst_area[int(i)] < a.min_area]
+    if dropped:
+        print(f"ignoring {len(dropped)} degenerate wall label(s) under {a.min_area} m^2: {dropped}")
+    keep_inst = np.isin(inst, scene_inst)
+    inst, inst_n = inst[keep_inst], inst_n[keep_inst]
     print(f"\nGT wall instances: {len(scene_inst)} in the scene, "
           f"{len(inst)} touched by this arm's scored points")
     recovered, assign = [], {}
@@ -140,6 +155,7 @@ def main():
               f"{'   RECOVERED' if best >= a.min_overlap else ''}")
     print(f"\nGT wall instances recovered: {len(recovered)}/{len(scene_inst)}")
     out["instances"] = {"gt_wall_instances": int(len(scene_inst)),
+                        "recovered_ids": recovered, "ignored_degenerate": dropped,
                         "gt_instances_touched": int(len(inst)),
                         "recovered": len(recovered),
                         "pred_wall_planes": len(assign),

@@ -80,6 +80,13 @@ def main():
     ap.add_argument("--min_length", type=float, default=2.0)
     ap.add_argument("--yaw_tol", type=float, default=10.0)
     ap.add_argument("--perp_tol", type=float, default=10.0)
+    ap.add_argument("--floor_height", type=float, default=None,
+                    help="use this floor height (along up) instead of estimating "
+                         "it. The estimate picks the largest low horizontal plane, "
+                         "which lands on a table or sofa top when the real floor "
+                         "is hidden or sparsely covered (0.6-0.7 m high on room1 "
+                         "billboards and office1). Passing one shared value lets "
+                         "different point sets be judged against the same floor")
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
 
@@ -125,7 +132,10 @@ def main():
     cands = [(len(q), int(i), float(np.median(heights[i])))
              for i, (c, n, q) in fits.items()
              if abs(float(n @ up)) > cos_h and np.median(heights[i]) < mid]
-    if cands:
+    if a.floor_height is not None:
+        floor_h, floor_id = float(a.floor_height), None
+        print(f"floor height given: {floor_h:.2f}")
+    elif cands:
         cands.sort(reverse=True)
         _, floor_id, floor_h = cands[0]
         print(f"floor plane = id {floor_id} ({cands[0][0]:,} pts), "

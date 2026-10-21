@@ -141,6 +141,19 @@ if [ -f "$SEM/mesh_semantic.ply" ]; then
         --json "$OUT/room_$arm.json" --png "$OUT/room_$arm.png" | grep -E "wall lines"
     $PY scripts/eval_footprint_gt.py --room "$OUT/room_$arm.json" --semantic "$SEM" \
         --json "$OUT/footprint_$arm.json" | head -1
+    $PY scripts/eval_floorplan_gt.py --room "$OUT/room_$arm.json" --semantic "$SEM" \
+        --json "$OUT/floorplan_$arm.json"
+  done
+  # depth walls re-placed with the positionally accurate billboards
+  for arm in depth_ransac depth_pca hybrid depth_ransac_cons depth_pca_cons hybrid_cons; do
+    echo "--- ${arm}_ref"
+    $PY scripts/room_polygon.py --labeled "$PC/planes_$arm.ply" --walls "$OUT/walls_$arm.json" \
+        --refine_cloud "$PC/planes_bb_ransac.ply" \
+        --json "$OUT/room_${arm}_ref.json" --png "$OUT/room_${arm}_ref.png" | grep -E "wall lines"
+    $PY scripts/eval_footprint_gt.py --room "$OUT/room_${arm}_ref.json" --semantic "$SEM" \
+        --json "$OUT/footprint_${arm}_ref.json" | head -1
+    $PY scripts/eval_floorplan_gt.py --room "$OUT/room_${arm}_ref.json" --semantic "$SEM" \
+        --json "$OUT/floorplan_${arm}_ref.json"
   done
   say "GT wall detection (point level)"
   for arm in $ARMS; do

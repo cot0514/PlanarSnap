@@ -11,7 +11,7 @@ cells, and its outline, simplified, is the polygon.
 Walls the segmentation missed leave the room open, and an open room touches
 the frame border and is rejected whole.  So the two dominant wall directions
 (the largest wall's and its perpendicular; the points' principal axes when
-there is no wall) get a "virtual" line at the 0.5th/99.5th percentile of the
+there is no wall) get a "virtual" line at the 2nd/98th percentile of the
 points along them -- where a missing wall would have to be at the latest in a
 closed room -- but only on a side with no detected wall in its outer half.
 Adding them everywhere hurts: rendered depth leaves floaters behind the walls,
@@ -19,12 +19,16 @@ so the virtual line lands outside the real wall and the strip between is
 taken for floor (depth polygons drop from ~88% to ~78% IoU).  --no_virtual
 turns them off.
 
-Replica, footprint IoU against the GT ceiling (5 scenes, mean): oracle 94.7%,
-depth + normal RANSAC after wall consolidation 89.1%, billboards 92.8% -- the
-billboards find almost no walls, but their positions are accurate to ~1 cm,
-so the virtual lines at their extent already fit these rectangular rooms.
-Depth's floaters behind the walls make its extent loose (oriented box 72%);
-its walls are what bring it to 89%.
+The room's orientation is voted by every near-vertical plane (90-degree-
+periodic mean, refined twice over the planes within 5 deg).  Voting with the
+walls alone let office1's few, noisy depth walls rotate the room by 5 deg.
+
+Depth finds the walls but places them coarsely (points 5-9 cm off the
+surface, floaters behind the walls); billboards place them to ~1 cm but find
+few.  --refine_cloud takes the billboards to re-place the depth walls and the
+virtual lines.  Replica, 5 scenes, boundary Chamfer to the GT outline:
+billboards alone 7.9 cm, hybrid+consolidated 9.6 cm, the same refined with
+billboards 7.5 cm; GT wall area rebuilt by the extruded walls 63% / 64% / 75%.
 
 Why an arrangement and not, say, the outline of the points themselves: the
 walls give straight, exactly placed edges, and a cell is accepted or rejected
@@ -43,7 +47,7 @@ import numpy as np
 import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from analyze_walls import load_labeled
+from analyze_walls import load_labeled, plane_area
 
 
 def horizontal_basis(up):
@@ -71,6 +75,16 @@ def main():
                     help="close the room with lines at the points' extent: only "
                          "on sides without a detected wall (open), on every side, "
                          "or never")
+    ap.add_argument("--refine_cloud", default=None,
+                    help="positionally accurate cloud (e.g. the billboards' "
+                         "planes_bb_ransac.ply) to place wall lines and virtual lines")
+    ap.add_argument("--refine_band", type=float, default=0.15)
+    ap.add_argument("--dominant", choices=["walls", "vertical"], default="vertical",
+                    help="planes that vote for the room's orientation: the walls, "
+                         "or every near-vertical plane")
+    ap.add_argument("--virtual_pct", type=float, default=2.0,
+                    help="virtual lines sit at this percentile of the points "
+                         "(and 100 minus it) along each dominant direction")
     ap.add_argument("--manhattan_tol", type=float, default=15.0,
                     help="snap walls within this of the dominant directions and "
                          "drop the rest; 0 keeps every wall as fitted")
@@ -110,14 +124,20 @@ def main():
     # one).  With no wall at all, every near-vertical plane votes instead --
     # furniture faces mostly align with the room too.  The points' principal
     # axis is NOT a usable fallback: on room1's billboards it is 45 deg off.
+    # The mean is then re-taken over the planes within 5 deg of it, twice: one
+    # oblique depth "wall" otherwise rotates the whole room (office1, ~3 deg).
     def dominant(ids):
-        z = 0j
-        for i in ids:
-            _, _, n2 = normal2(i)
-            z += int((lab == i).sum()) * np.exp(4j * np.arctan2(n2[1], n2[0]))
-        t = np.angle(z) / 4
+        yaw = {i: np.arctan2(normal2(i)[2][1], normal2(i)[2][0]) for i in ids}
+        cnt = {i: int((lab == i).sum()) for i in ids}
+        t = np.angle(sum(cnt[i] * np.exp(4j * yaw[i]) for i in ids)) / 4
+        for _ in range(2):
+            near = [i for i in ids
+                    if abs(np.angle(np.exp(4j * (yaw[i] - t)))) / 4 < np.radians(5)]
+            if not near:
+                break
+            t = np.angle(sum(cnt[i] * np.exp(4j * yaw[i]) for i in near)) / 4
         return np.array([np.cos(t), np.sin(t)])
-    voters = list(w["wall_ids"])
+    voters = list(w["wall_ids"]) if a.dominant == "walls" else []
     if not voters:
         voters = [i for i in np.unique(lab) if i >= 0
                   and abs(float(normal2(i)[1] @ up)) < np.sin(np.radians(20))]
@@ -140,6 +160,51 @@ def main():
         lines.append((i, np.array([c @ e1, c @ e2]), n2))
     band = (h > floor - 0.2)
     Pb = P[band]
+
+    # --refine_cloud: a second, positionally accurate point set (the billboard
+    # centres, ~1 cm off the surface against 5-9 cm for rendered depth).  Each
+    # wall line keeps its direction but moves to the median offset of the
+    # accurate points within --refine_band of it, along the wall's own extent;
+    # and the virtual lines are placed at the accurate points' extent instead
+    # of the depth cloud's, which floaters behind the walls push outward.
+    if a.refine_cloud:
+        R3 = load_labeled(a.refine_cloud)[0]
+        hr = R3 @ up
+        R2all = np.stack([R3 @ e1, R3 @ e2], 1)
+        R2 = R2all[(hr > floor + 0.1) & (hr < floor + 2.0)]      # wall height band
+        moved = []
+        for k, (i, p, n2) in enumerate(lines):
+            d = np.array([-n2[1], n2[0]])
+            q = xyz[lab == i]
+            t = np.stack([q @ e1, q @ e2], 1) @ d
+            tr = R2 @ d
+            r = (R2 - p) @ n2
+            near = (np.abs(r) < a.refine_band) & (tr > np.percentile(t, 2.5)) & (tr < np.percentile(t, 97.5))
+            if near.sum() >= 30:
+                dr = float(np.median(r[near]))
+                lines[k] = (i, p + dr * n2, n2)
+                moved.append(dr)
+        if moved:
+            print(f"refine: moved {len(moved)} of {len(lines)} wall lines by median "
+                  f"{100 * np.median(np.abs(moved)):.1f} cm")
+        Pb = R2all[hr > floor - 0.2]
+
+    # ceiling height, the mirror of analyze_walls' floor rule: the HIGHEST
+    # horizontal plane of real size (>= 1 m^2 and a quarter of the largest
+    # candidate) in the upper half.  Falls back to the 99.5th percentile.
+    lo_h, hi_h = np.percentile(h[band], [0.5, 99.5])
+    cands = []
+    for i in np.unique(lab):
+        if i < 0:
+            continue
+        c, n, _ = normal2(i)
+        hi_i = h[lab == i]
+        if abs(float(n @ up)) > np.cos(np.radians(20)) and np.median(hi_i) > 0.5 * (lo_h + hi_h):
+            cands.append((plane_area(xyz[lab == i]), float(np.median(hi_i))))
+    if cands:
+        min_a = max(1.0, 0.25 * max(c[0] for c in cands))
+        cands = [c for c in cands if c[0] >= min_a]
+    ceiling = max(c[1] for c in cands) if cands else float(hi_h)
     virtual = []
     if a.virtual != "none":
         cos_par = np.cos(np.radians(15))
@@ -148,7 +213,7 @@ def main():
             mid = np.median(proj)
             # offsets of the walls parallel to d, in d's sign convention
             offs = [float(p @ d) for _, p, n2 in lines if abs(float(n2 @ d)) > cos_par]
-            for pct, sign in ((0.5, -1), (99.5, 1)):
+            for pct, sign in ((a.virtual_pct, -1), (100 - a.virtual_pct, 1)):
                 ext = float(np.percentile(proj, pct))
                 outer = mid + 0.5 * (ext - mid)
                 if a.virtual == "open" and any(sign * (o - outer) >= 0 for o in offs):
@@ -218,7 +283,10 @@ def main():
            "e1": e1.tolist(), "e2": e2.tolist(), "floor_height": floor,
            "polygon": poly_m.tolist(), "area": room_area,
            "raster": {"lo": lo.tolist(), "res": a.res, "shape": [int(H), int(W)]},
-           "n_wall_lines": len(lines), "dirs": [d.tolist() for d in dirs]}
+           "n_wall_lines": len(lines), "dirs": [d.tolist() for d in dirs],
+           "ceiling_height": ceiling,
+           "lines": [{"wall_id": None if i is None else int(i), "p": p.tolist(),
+                      "n": n2.tolist()} for i, p, n2 in lines + virtual]}
     with open(a.json, "w") as f:
         json.dump(out, f, indent=1)
     np.save(os.path.splitext(a.json)[0] + "_mask.npy", room)

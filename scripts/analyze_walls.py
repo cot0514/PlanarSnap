@@ -130,6 +130,10 @@ def main():
                          "when the plane sits this far above it; wall bottoms "
                          "scatter a few cm under a correctly found floor "
                          "(drjohnson: 7-14 cm)")
+    ap.add_argument("--floor_cap_max", type=float, default=1.0,
+                    help="...and only when it sits less than this above them; "
+                         "no furniture top is higher, so a larger gap means the "
+                         "wall bottoms are wrong (reflections below a glossy floor)")
     ap.add_argument("--floor_height", type=float, default=None,
                     help="use this floor height (along up) instead of estimating "
                          "it. Passing one shared value lets different point sets "
@@ -211,8 +215,14 @@ def main():
         floor_id, floor_src = None, "percentile"
         print(f"no horizontal plane found low in the scene; "
               f"using the 1st percentile of all heights, {floor_h:.2f}")
+    # The cap is for a floor plane that is really a table top or a platform,
+    # and furniture tops sit less than a metre up (tables ~0.75 m, counters
+    # ~0.9 m, office1's platform 0.47 m).  If the wall bottoms reach further
+    # below the plane than that, the bottoms are wrong, not the floor: on
+    # drjohnson's glossy floor the hybrid's wall planes pick up reflected
+    # depth 1.3 m under a 60 m^2 floor.
     if a.floor_height is None and wall_cap is not None \
-            and floor_h - wall_cap > a.floor_cap_margin:
+            and a.floor_cap_margin < floor_h - wall_cap < a.floor_cap_max:
         print(f"  ...but {len(bottoms)} large vertical planes end lower (10th pct "
               f"of their bottoms {wall_cap:.2f}); the floor plane is furniture or "
               f"a platform, using {wall_cap:.2f}")

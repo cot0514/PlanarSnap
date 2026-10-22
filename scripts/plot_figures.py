@@ -20,6 +20,9 @@ carries the explanation).
   floorplan_accuracy.png  -- boundary error and rebuilt wall area (10.5)
   wall_elevation.png      -- room0's GT walls unrolled: observed wall points vs
                              extruded walls (10.5)
+  drjohnson.png           -- the real capture (no GT): floorplans of three
+                             methods from above, edges on detected walls vs
+                             virtual edges, and the hybrid's room in 3-D (5.8)
 
 Reads the planes_*.ply / walls_*.json / room_*.json that
 run_replica_scene.sh writes.
@@ -434,6 +437,79 @@ def fig_elevation(out, scene="room0", dist=0.10):
     fig.savefig(out, dpi=180); plt.close(fig)
 
 
+# ------------------------------------------------------------------------
+def edge_kinds(r, dist=0.10):
+    """For each polygon edge: True if it lies on a detected wall line."""
+    poly = np.asarray(r["polygon"])
+    kinds = []
+    for p0, p1 in zip(poly, np.roll(poly, -1, axis=0)):
+        L = max(np.linalg.norm(p1 - p0), 1e-9)
+        en = np.array([-(p1 - p0)[1], (p1 - p0)[0]]) / L
+        mid = 0.5 * (p0 + p1)
+        best = None
+        for ln in r["lines"]:
+            n = np.asarray(ln["n"])
+            if abs(float(n @ en)) < np.cos(np.radians(10)):
+                continue
+            d = abs(float((mid - np.asarray(ln["p"])) @ n))
+            if d < dist and (best is None or d < best[0]):
+                best = (d, ln["wall_id"] is not None)
+        kinds.append(bool(best and best[1]))
+    return kinds
+
+
+def fig_drjohnson(out, azim=-60, elev=30):
+    D = f"{OUT}/drjohnson_v1"
+    pc = f"{D}/point_cloud/iteration_32000"
+    arms = [("Billboards (normal RANSAC)", "bb_pca_cons"),
+            ("Depth + normal RANSAC, refit", "depth_pca_cons_ref"),
+            ("Hybrid, refit", "hybrid_cons_ref")]
+    rooms = [(n, json.load(open(f"{D}/room_{a}.json"))) for n, a in arms]
+    F = Frame(rooms[-1][1])                     # one frame for all panels
+    X = np.load(f"{D}/depth_cloud_v05.npz")["xyz"]
+    h = F.height(X)
+    P = F.from3(X[(h > 0.1) & (h < 2.2)])
+    allp = np.vstack([F.from2(r["polygon"]) for _, r in rooms])
+    c = 0.5 * (allp.min(0) + allp.max(0)); half = 0.5 * np.ptp(allp, axis=0) + 1.5
+
+    fig = plt.figure(figsize=(15, 9))
+    for k, (name, r) in enumerate(rooms):
+        ax = fig.add_axes([0.02 + 0.33 * k, 0.53, 0.30, 0.38])
+        ax.scatter(P[:, 0], P[:, 1], s=0.15, color=OTHER, lw=0, rasterized=True)
+        poly = F.from2(r["polygon"])
+        for (a, b), wall in zip(zip(poly, np.roll(poly, -1, axis=0)), edge_kinds(r)):
+            ax.plot([a[0], b[0]], [a[1], b[1]], color=BLUE if wall else ORANGE, lw=2.2,
+                    ls="-" if wall else (0, (3, 1.6)), solid_capstyle="round")
+        ax.set_xlim(c[0] - half[0], c[0] + half[0]); ax.set_ylim(c[1] - half[1], c[1] + half[1])
+        ax.set_aspect("equal"); off_axes(ax)
+        walls = json.load(open(r["walls"]))["walls"]
+        label(ax, name, f"{walls} walls, {r['area']:.0f} m$^2$, {len(r['polygon'])} corners")
+    x0, y0 = c[0] - half[0] + 0.3, c[1] - half[1] + 0.3
+    fig.axes[0].plot([x0, x0 + 2], [y0, y0], color=INK2, lw=1.5)
+    fig.axes[0].text(x0 + 1, y0 + 0.15, "2 units", ha="center", va="bottom", fontsize=10, color=INK2)
+
+    r = rooms[-1][1]
+    H = float(r["ceiling_height"]) - F.floor
+    poly = F.from2(r["polygon"])
+    lo, hi = poly.min(0) - 0.1, poly.max(0) + 0.1
+    ax = fig.add_axes([0.04, -0.04, 0.92, 0.56], projection="3d")
+    d = PlyData.read(f"{pc}/point_cloud.ply").elements[0].data
+    B = np.stack([d["x"], d["y"], d["z"]], 1).astype(np.float64)
+    rgb = np.clip(0.5 + 0.28209479 * np.stack([d["f_dc_0"], d["f_dc_1"], d["f_dc_2"]], 1), 0, 1)
+    room_points(ax, B, rgb, F, H, lo, hi, n=90000)
+    extruded(ax, poly, H, azim)
+    frame3d(ax, lo, hi, H, azim, elev)
+    ax.set_box_aspect((hi[0] - lo[0], hi[1] - lo[1], H), zoom=1.15)
+    label(ax, "Hybrid, refit: walls extruded floor to ceiling", "billboards coloured, front walls cut away",
+          three_d=True)
+    fig.legend(handles=[Line2D([], [], color=BLUE, lw=2.2, label="edge on a detected wall"),
+                        Line2D([], [], color=ORANGE, lw=2.2, ls=(0, (3, 1.6)), label="virtual edge"),
+                        Line2D([], [], color=OTHER, marker="o", ls="", ms=5, label="depth points, wall height")],
+               loc="upper center", ncol=3, frameon=False, fontsize=11, labelcolor=INK2,
+               bbox_to_anchor=(0.5, 0.99))
+    fig.savefig(out, dpi=170); plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="docs/figures")
@@ -444,7 +520,7 @@ def main():
             ("depth_accuracy", fig_depth_accuracy), ("wall_detection", fig_wall_detection),
             ("up_correction", fig_up_correction), ("segmentation", fig_segmentation),
             ("floorplans", fig_floorplans), ("floorplan_accuracy", fig_floorplan_accuracy),
-            ("wall_elevation", fig_elevation)]
+            ("wall_elevation", fig_elevation), ("drjohnson", fig_drjohnson)]
     want = set(a.only.split(",")) if a.only else None
     for name, fn in jobs:
         if want and name not in want:

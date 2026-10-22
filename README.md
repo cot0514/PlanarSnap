@@ -225,6 +225,10 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" /v TdrLevel /t R
 │   ├── eval_wall_geometry_gt.py    # (PlanarSnap) GT 벽 평면 기하
 │   ├── eval_coverage_gt.py         # (PlanarSnap) 클래스별 표면 커버리지
 │   ├── eval_floor_gt.py            # (PlanarSnap) GT up 방향·바닥 높이
+│   ├── consolidate_walls.py        # (PlanarSnap) 벽 조각 통합
+│   ├── room_polygon.py             # (PlanarSnap) 벽 평면 → 방 다각형
+│   ├── eval_footprint_gt.py        # (PlanarSnap) GT 평면도 IoU
+│   ├── eval_floorplan_gt.py        # (PlanarSnap) 경계 거리·3D 벽 복원
 │   ├── run_replica_scene.sh        # (PlanarSnap) 한 씬 전체 파이프라인
 │   └── summarize_replica.py        # (PlanarSnap) 5씬 결과 집계
 ├── submodules
@@ -508,6 +512,46 @@ room_v18에서 관측된 실제 사례 — 84개 조각이 11개 "평면"으로 
 | room_v18 | 84 → 11개 | 84 → **21개** | 0.093 (기준 0.193) |
 
 > 수정 전 결과로 생성했던 분할 결과·시각화는 이 병합 오류의 영향을 받았을 수 있습니다.
+
+## 평면도 재구성 (PlanarSnap)
+
+분할된 벽 평면으로 가구에 가려진 부분까지 포함한 방의 평면도와 벽을 복원합니다.
+
+```bash
+PC=<모델_경로>/point_cloud/iteration_32000
+# 0) 벽 판정 — up 방향을 평면 법선으로 보정하고 바닥 높이를 추정
+python scripts/analyze_walls.py --labeled $PC/planes_hybrid.ply \
+    --cameras <모델_경로>/cameras.json --json walls_hybrid.json
+# 1) 같은 벽의 조각을 한 평면으로 통합
+python scripts/consolidate_walls.py --labeled $PC/planes_hybrid.ply \
+    --cameras <모델_경로>/cameras.json --out $PC/planes_hybrid_cons.ply
+python scripts/analyze_walls.py --labeled $PC/planes_hybrid_cons.ply \
+    --cameras <모델_경로>/cameras.json --json walls_hybrid_cons.json
+# 2) 방 다각형 — 벽 위치는 정확한 빌보드 점으로 보정
+python scripts/room_polygon.py --labeled $PC/planes_hybrid_cons.ply \
+    --walls walls_hybrid_cons.json --refine_cloud $PC/planes_bb_ransac.ply \
+    --json room.json --png room.png
+```
+
+| 단계 | 하는 일 | 핵심 |
+|---|---|---|
+| 0. up·바닥 | 카메라 포즈의 up을 평면 법선으로 보정, 충분히 큰 가장 낮은 수평면을 바닥으로 | 카메라 up은 중력에서 4~9° 기울어 있었음 → 0~3° |
+| 1. 벽 통합 | 방향 15°·오프셋 15 cm 이내 수직 조각 병합 후 강건 재피팅 | 한 평면이 벽의 50% 이상을 덮는 벽: depth 6 → 13개 |
+| 2. 다각형 | 벽 직선으로 평면을 셀로 나누고(arrangement) 관측된 셀의 합집합을 외곽선으로 | 맨해튼 정규화, 벽이 없는 쪽은 점 범위에 가상 벽 |
+| 3. 3D 벽 | 다각형의 각 변을 바닥~천장으로 세움 | 가구에 가려진 벽 아랫부분까지 복원 |
+
+Replica 5씬, GT(천장 투영·시맨틱 벽) 대비:
+
+| 방법 | 평면도 IoU | 경계 Chamfer | 3D 벽 면적 복원 | 50% 이상 복원된 벽 |
+|---|---|---|---|---|
+| 빌보드 + RANSAC (기존) | 93.1% | 7.9 cm | 63.0% | 13/22 |
+| 혼합 + 벽 통합 | 90.8% | 9.6 cm | 64.4% | 13/22 |
+| **혼합 + 벽 통합 + 빌보드 보정** | 92.4% | **7.5 cm** | **74.7%** | **16/22** |
+| GT depth (오라클) | 95.7% | 4.3 cm | 88.5% | 18/22 |
+
+> **해석 주의**: Replica 방은 모두 직사각형이라, 벽을 거의 못 찾는 빌보드도 점 범위에 세운 가상 벽만으로 높은 IoU를 얻습니다(빌보드가 실제로 관측한 벽 점은 GT 벽 면적의 14%). 그래서 경계 거리와 3D 벽 복원율로 비교했고, **depth로 벽을 찾고 빌보드로 위치를 맞추는 결합**이 두 단독 방식을 모두 앞섰습니다. 직사각형이 아닌 방에서는 검증하지 않았습니다.
+
+평가는 `eval_footprint_gt.py`(평면도 IoU), `eval_floorplan_gt.py`(경계 거리·방 회전·3D 벽 복원), `eval_floor_gt.py`(up·바닥)이며, `scripts/run_replica_scene.sh`가 Replica 한 씬의 전 과정을 실행합니다.
 
 ---
 

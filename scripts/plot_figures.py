@@ -23,6 +23,9 @@ carries the explanation).
   drjohnson.png           -- the real capture (no GT): floorplans of three
                              methods from above, edges on detected walls vs
                              virtual edges, and the hybrid's room in 3-D (5.8)
+  rooms3d.png             -- every room rebuilt in 3-D (hybrid + merged walls
+                             + billboard refit): five Replica scenes and
+                             drjohnson, billboards coloured, front walls cut away
 
 Reads the planes_*.ply / walls_*.json / room_*.json that
 run_replica_scene.sh writes.
@@ -510,6 +513,47 @@ def fig_drjohnson(out, azim=-60, elev=30):
     fig.savefig(out, dpi=170); plt.close(fig)
 
 
+# ------------------------------------------------------------------------
+def billboard_rgb(path):
+    d = PlyData.read(path).elements[0].data
+    X = np.stack([d["x"], d["y"], d["z"]], 1).astype(np.float64)
+    rgb = np.clip(0.5 + 0.28209479 * np.stack([d["f_dc_0"], d["f_dc_1"], d["f_dc_2"]], 1), 0, 1)
+    return X, rgb
+
+
+def room3d(ax, model, room, azim, elev, n=70000):
+    r = json.load(open(f"{model}/{room}.json"))
+    F = Frame(r)
+    H = float(r["ceiling_height"]) - F.floor
+    poly = F.from2(r["polygon"])
+    lo, hi = poly.min(0) - 0.1, poly.max(0) + 0.1
+    X, rgb = billboard_rgb(f"{model}/point_cloud/iteration_32000/point_cloud.ply")
+    room_points(ax, X, rgb, F, H, lo, hi, n=n)
+    extruded(ax, poly, H, azim)
+    frame3d(ax, lo, hi, H, azim, elev)
+    ax.set_box_aspect((hi[0] - lo[0], hi[1] - lo[1], H), zoom=0.9)   # room for the title
+    return r
+
+
+def fig_rooms3d(out, azim=-58, elev=30):
+    fig = plt.figure(figsize=(16, 9.6))
+    panels = [(s, f"{OUT}/replica_{s}_v1") for s in SCENES] + [("drjohnson", f"{OUT}/drjohnson_v1")]
+    for k, (s, model) in enumerate(panels):
+        ax = fig.add_subplot(2, 3, k + 1, projection="3d")
+        room3d(ax, model, "room_hybrid_cons_ref", azim, elev)
+        if s == "drjohnson":
+            sub = "real capture, no GT"
+        else:
+            fp = J(s, "footprint_hybrid_cons_ref"); fl = J(s, "floorplan_hybrid_cons_ref")
+            sub = f"IoU {100 * fp['iou']:.0f}%, boundary {fl['chamfer_cm']:.1f} cm, walls rebuilt {100 * fl['wall_recall_3d']:.0f}%"
+        label(ax, s, sub, three_d=True)
+    fig.legend(handles=[Patch(facecolor=BLUE, alpha=0.3, edgecolor=BLUE, label="reconstructed walls and floor"),
+                        Line2D([], [], color="#8a6d55", marker="o", ls="", ms=5, label="trained billboards (colour)")],
+               loc="lower center", ncol=2, frameon=False, fontsize=11, labelcolor=INK2)
+    fig.subplots_adjust(left=0, right=1, top=0.99, bottom=0.05, wspace=0.0, hspace=0.0)
+    fig.savefig(out, dpi=170); plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="docs/figures")
@@ -520,7 +564,8 @@ def main():
             ("depth_accuracy", fig_depth_accuracy), ("wall_detection", fig_wall_detection),
             ("up_correction", fig_up_correction), ("segmentation", fig_segmentation),
             ("floorplans", fig_floorplans), ("floorplan_accuracy", fig_floorplan_accuracy),
-            ("wall_elevation", fig_elevation), ("drjohnson", fig_drjohnson)]
+            ("wall_elevation", fig_elevation), ("drjohnson", fig_drjohnson),
+            ("rooms3d", fig_rooms3d)]
     want = set(a.only.split(",")) if a.only else None
     for name, fn in jobs:
         if want and name not in want:

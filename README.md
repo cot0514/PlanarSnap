@@ -229,8 +229,7 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" /v TdrLevel /t R
 │   ├── room_polygon.py             # (PlanarSnap) 벽 평면 → 방 다각형
 │   ├── eval_footprint_gt.py        # (PlanarSnap) GT 평면도 IoU
 │   ├── eval_floorplan_gt.py        # (PlanarSnap) 경계 거리·3D 벽 복원
-│   ├── plot_floorplans.py          # (PlanarSnap) 평면도 결과 그림
-│   ├── plot_presentation.py        # (PlanarSnap) 발표용 그림 (한국어, 16:9)
+│   ├── plot_floorplans.py          # (PlanarSnap) 결과 그림 (빌보드 vs depth, 분할 과정, 평면도)
 │   ├── run_replica_scene.sh        # (PlanarSnap) 한 씬 전체 파이프라인
 │   └── summarize_replica.py        # (PlanarSnap) 5씬 결과 집계
 ├── submodules
